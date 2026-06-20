@@ -41,6 +41,9 @@ yarn.lock
 media/
 *.log
 
+# User footage + session outputs (never vendor source media into the skill repo)
+raw-video/
+
 # Session artifacts if someone invokes the skill inside the project dir
 # (normally outputs go to <videos_dir>/edit/ — keep these as a safety net)
 edit/

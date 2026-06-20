@@ -320,3 +320,45 @@ Things that consistently fail regardless of style:
 - **Editing before confirming the strategy.** Never.
 - **Re-transcribing cached sources.** Immutable outputs of immutable inputs.
 - **Assuming what kind of video it is.** Look first, ask second, edit last.
+- **Trusting Scribe's first pass on noisy sources.** When the source has ambient sound (cooking, walking, tapping, music bed), Scribe collapses content into giant `audio_event` blobs with no word-level timing. Always do a second pass with `diarize=false, tag_audio_events=false` and merge.
+- **Trusting prefix-only dedupe with strict thresholds.** Comparing only the first 40 chars at ratio≥0.75 plus a "next-is-1.5×-longer" gate misses partial-restate retakes (false start ~ same length as the good take, or false start opens with different filler). Broaden to 80 chars at ratio≥0.65, drop the shorter side regardless of which is longer. For ambiguous pairs and intra-block retakes, the in-loop LLM decides — see "Claude-driven retake removal".
+- **Delegating semantic dedup to an external LLM (Gemini) when an in-loop LLM is driving.** You are the judge — read the transcript and decide. An external Flash pass is weaker, rate-limited, and (incident 2026-06-20) silently returned "0 cuts" after caching 69/82 empty 429 responses. Reserve `--llm-review` for standalone/headless runs only.
+- **Rendering before verifying at the text layer.** A render is ~30 min; reading the new EDL's transitions as text is ~5s and catches broken/cut-off sentences before you burn the render. Verify EDL/text first, pixels second.
+
+## Worked example: Vietnamese single-source aggressive cut
+
+For a single talking-head source where the user wants pure cleanup (cut pauses ≥1s, fillers, false starts, repeats), use `helpers/aggressive_cut_vi.py`. It bakes in:
+
+- **Dual transcribe + hybrid merge** (handles Scribe's collapse-into-audio-event bug)
+- **Broken token detection**: any word with `end - start > 5.0` is a Scribe artifact — fall back to the original transcript's words for that span
+- **Slate auto-detect**: drop everything before first hybrid word (clean transcript naturally skips slate)
+- **Aggressive cuts at gap ≥1s** with surgical trim of trailing `--` cutoffs and leading fillers
+- **Two-tier dedupe**:
+  - Tier B (rule): SequenceMatcher ratio ≥ 0.65 on first 80 chars; drop the SHORTER block of the pair when `min(d1,d2) < 10s`. No "next-is-longer" gate. Deterministic, no API.
+  - Tier C (LLM): **DEFAULT OFF (changed 2026-06-20).** Opt-in `--llm-review` only for standalone/headless runs (cron, batch) with no in-loop LLM. When Claude (or any in-loop LLM) drives, do the semantic pass yourself — see **"Claude-driven retake removal"** below. Do NOT call Gemini.
+  - Limitation of aggressive_cut alone: catches only CROSS-block retakes (takes separated by ≥gap pause). Within-block stutter+restart ("nói lại ngay", no ≥gap pause) joins into one string and survives. The Claude-driven pass below handles these.
+
+Helpers:
+- `helpers/aggressive_cut_vi.py <video>` — full pipeline, no questions, sane defaults (1080p, no subs, no grade). LLM review OFF by default.
+- `helpers/aggressive_cut_vi.py <video> --llm-review` — (standalone/headless ONLY) opt-in Gemini cross-block review.
+- `helpers/apply_retake_cuts.py <edit_dir> --cuts cuts.json` — apply Claude-decided retake cuts (cross + intra block) to an EDL at the word level. No external API.
+- Filler regex: `^(ờ|ừ|ơ|à|ờm|ừm|èm|hờ|ầm|uhm|umm)[.,!?-]*$`
+
+### Claude-driven retake removal (PREFERRED when an in-loop LLM is driving)
+
+**You (the in-loop LLM) are the dedup judge. Never delegate semantic retake decisions to Gemini when you can read the transcript yourself** — you are stronger than Flash, have no rate limit, and never cache empty 429 responses. (Cost incident 2026-06-20: a per-range Gemini pass hit 429 on 69/82 calls, cached the empties, and silently returned "0 cuts" — Claude reading the transcript directly fixed it in one pass.)
+
+Workflow after `aggressive_cut_vi.py` produces `edl.json`:
+
+1. **Dump ranges as readable text** (one line per range: `[idx] start-end (Ns): full text`). Read all of them.
+2. **Decide cuts yourself**, distinguishing real retakes from intentional rhetoric:
+   - **Cut**: false starts, cutoffs (`--`), and "say-it-again" repeats where the next take is fuller/cleaner. A short block fully superseded by the next → drop whole.
+   - **KEEP**: intentional anaphora / parallelism ("có người vì X… có người vì Y", "không nằm ở chỗ X mà ở chỗ Y"). A verbatim 8–10-word repeat is almost always a retake; a connective phrase reused across different sentences is not.
+3. **Write a decisions JSON** (`cuts.json`): `{"drops":[...], "tails":{"i":"anchor"}, "heads":{...}, "spans":{...}}`. Anchor by a word phrase (normalized match, first occurrence) — make head/span anchors specific (include a distinguishing word) when the phrase repeats inside the block.
+4. **Apply**: `python helpers/apply_retake_cuts.py <edit_dir> --cuts cuts.json` → `edl_v2.json`. Confirm **"all anchors matched OK"** (it prints FAILs).
+5. **Verify at the text layer FIRST** — dump `edl_v2.json` transitions and read them; broken/cut-off sentences are obvious in text and cost 5s to catch vs a 30-min render. Fix anchors, re-apply.
+6. **Render**: `python helpers/render.py <edit_dir>/edl_v2.json -o <edit_dir>/final.mp4` (loudnorm −14 LUFS default), then self-eval the pixels.
+
+When Hard Rule 11 (strategy confirmation) can be skipped: only when the user explicitly says "đừng hỏi nữa, cứ thế mà làm" or similar standing directive, AND the work matches one of these worked patterns. New aesthetics, new structures, multi-source assemblies, anything with subtitles/grade/animation — confirmation still required.
+
+Real numbers from the first run (49.65 min Vietnamese monologue, 18.7 GB source): output 30.35 min, cut 38.9%, 118 keep blocks, render time ~30 min.
