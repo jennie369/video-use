@@ -69,7 +69,8 @@ def main():
     heads = {int(k): v for k, v in cuts.get("heads", {}).items()}
     spans = {int(k): v for k, v in cuts.get("spans", {}).items()}
 
-    tr = json.load(open(next((edit / "transcripts").glob("*[!-clean].json")), encoding="utf-8"))
+    _tpath = next(p for p in (edit / "transcripts").glob("*.json") if not p.stem.endswith("-clean"))
+    tr = json.load(open(_tpath, encoding="utf-8"))
     words = [w for w in tr["words"] if w.get("type") == "word"]
     base = json.load(open(edl_path, encoding="utf-8"))
 
