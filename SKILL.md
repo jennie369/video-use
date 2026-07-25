@@ -355,7 +355,7 @@ Workflow after `aggressive_cut_vi.py` produces `edl.json`:
    - **Cut**: false starts, cutoffs (`--`), and "say-it-again" repeats where the next take is fuller/cleaner. A short block fully superseded by the next → drop whole.
    - **KEEP**: intentional anaphora / parallelism ("có người vì X… có người vì Y", "không nằm ở chỗ X mà ở chỗ Y"). A verbatim 8–10-word repeat is almost always a retake; a connective phrase reused across different sentences is not.
 3. **Write a decisions JSON** (`cuts.json`): `{"drops":[...], "tails":{"i":"anchor"}, "heads":{...}, "spans":{...}}`. Anchor by a word phrase (normalized match, first occurrence) — make head/span anchors specific (include a distinguishing word) when the phrase repeats inside the block.
-4. **Apply**: `python helpers/apply_retake_cuts.py <edit_dir> --cuts cuts.json` → `edl_v2.json`. Confirm **"all anchors matched OK"** (it prints FAILs).
+4. **Apply**: `python helpers/apply_retake_cuts.py <edit_dir> --cuts cuts.json` → `edl_v2.json`. It **exits 1** on `FAIL` (anchor not found) or `AMBIGUOUS` (a tail/head anchor matching >1x in its block — the cut fires on the FIRST match and can silently eat real content). Only **"all anchors matched OK and unique"** + exit 0 means go.
 5. **Verify at the text layer FIRST** — dump `edl_v2.json` transitions and read them; broken/cut-off sentences are obvious in text and cost 5s to catch vs a 30-min render. Fix anchors, re-apply.
 6. **Render**: `python helpers/render.py <edit_dir>/edl_v2.json -o <edit_dir>/final.mp4` (loudnorm −14 LUFS default), then self-eval the pixels.
 

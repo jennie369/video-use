@@ -21,9 +21,17 @@ Decisions JSON (--cuts):
 Block index = position in the input EDL's ranges[]. Anchors are matched on the
 normalized word sequence (case/punct-insensitive), FIRST occurrence. Make anchors
 specific enough to be unique (include a distinguishing word for head/span when the
-phrase repeats). The tool PRINTS match/FAIL per op so anchors are verifiable —
-ALWAYS check "all anchors matched OK" and verify resulting text reads clean at the
-EDL/text layer BEFORE rendering (cheaper than a 30-min render).
+phrase repeats).
+
+The tool PRINTS match/FAIL/AMBIGUOUS per op and EXITS 1 on any of them:
+  FAIL      = anchor not found at all.
+  AMBIGUOUS = a tail/head anchor matches >1x in its block. The cut fires on the
+              FIRST match, so the extent silently balloons and can delete real
+              content — this used to still report "matched OK". A span matching
+              >1x is only a note (dropping the first of a repeated pair is a
+              documented use).
+Exit 0 means "all anchors matched OK and unique". Still verify the resulting text
+reads clean at the EDL/text layer BEFORE rendering (cheaper than a 30-min render).
 
 Usage:
   python helpers/apply_retake_cuts.py <edit_dir> --cuts cuts.json
@@ -49,6 +57,21 @@ def find_seq(tokens, anchor):
         if T[i:i + len(A)] == A:
             return i, len(A)
     return -1, len(A)
+
+
+def count_seq(tokens, anchor):
+    """How many times the anchor matches inside this block.
+
+    >1 on a tail/head is DANGEROUS: the cut fires on the FIRST match, so the
+    extent silently balloons and can eat real content while the run still
+    reports 'matched OK'. >1 on a span is legitimate (documented way to drop
+    the first of a repeated pair — see VIDEO_EDITING_EVOLUTION_LOG 2026-06-25).
+    """
+    A = [norm(x) for x in anchor.split() if norm(x)]
+    T = [norm(w["text"]) for w in tokens]
+    if not A:
+        return 0
+    return sum(1 for i in range(len(T) - len(A) + 1) if T[i:i + len(A)] == A)
 
 
 def main():
@@ -77,7 +100,7 @@ def main():
     def win(s, e):
         return [w for w in words if w["end"] > s and w["start"] < e]
 
-    new_ranges, fails = [], []
+    new_ranges, fails, ambigs = [], [], []
     for idx, r in enumerate(base["ranges"]):
         if idx in drops:
             print(f"[{idx:02d}] DROP (whole block)")
@@ -106,6 +129,15 @@ def main():
             elif kind == "span":
                 for j in range(i, i + L):
                     keep[j] = False
+            n_hits = count_seq(ws, anchor)
+            if n_hits > 1 and kind in ("tail", "head"):
+                ambigs.append((idx, kind, anchor, n_hits))
+                print(f"[{idx:02d}] !! AMBIGUOUS {kind}: '{anchor}' matches {n_hits}x in this "
+                      f"block — {kind} fires on the FIRST match and may eat real content. "
+                      f"Make the anchor unique (add a distinguishing word), or use a span.")
+            elif n_hits > 1:
+                print(f"[{idx:02d}] note: span '{anchor}' matches {n_hits}x — cutting the FIRST "
+                      f"occurrence (documented behaviour)")
             print(f"[{idx:02d}] {kind} OK @word{i} (len {L if kind=='span' else '-'})")
 
         # contiguous kept runs -> sub-ranges
@@ -143,8 +175,14 @@ def main():
         print(f"!! {len(fails)} ANCHOR FAILURES — fix anchors before render:")
         for idx, k, a in fails:
             print(f"   [{idx}] {k}: {a}")
-    else:
-        print("all anchors matched OK — now verify text reads clean, THEN render")
+    if ambigs:
+        print(f"!! {len(ambigs)} AMBIGUOUS ANCHORS — tail/head fires on the FIRST match, so the "
+              f"cut may have eaten real content. Re-read those blocks before render:")
+        for idx, k, a, n in ambigs:
+            print(f"   [{idx}] {k}: '{a}' ({n} matches)")
+    if fails or ambigs:
+        raise SystemExit(1)
+    print("all anchors matched OK and unique — now verify text reads clean, THEN render")
 
 
 if __name__ == "__main__":
