@@ -333,18 +333,31 @@ def compute_cut_plan(
             blocks[-1].append(hybrid[i])
 
     keep, skip_counts = [], {"PURE_FILLER": 0, "CUTOFF": 0, "SHORT": 0}
+    # Every block we throw away, with its verbatim text, so the operator can
+    # confirm it really was a retake instead of real content the dedupe ate.
+    # Counts alone can't distinguish those two (VIDEO_EDITING_EVOLUTION_LOG
+    # Consolidated Rule 10).
+    dropped: list[dict] = []
+
+    def _record_drop(start, end, text, reason):
+        dropped.append({"start": start, "end": end, "reason": reason, "text": text})
+
     intra_drops_total = 0
     for block in blocks:
         n = len(block)
         bs, be = block[0]["start"], block[-1]["end"]
+        btext = " ".join(w["text"] for w in block)
         if n <= 3 and all(FILLER_RE.match(w["text"]) for w in block):
             skip_counts["PURE_FILLER"] += 1
+            _record_drop(bs, be, btext, "pure_filler")
             continue
         if n <= 2 and any(w["text"].endswith("--") or w["text"].endswith("-") for w in block):
             skip_counts["CUTOFF"] += 1
+            _record_drop(bs, be, btext, "cutoff")
             continue
         if (be - bs) < 0.4 and n <= 2:
             skip_counts["SHORT"] += 1
+            _record_drop(bs, be, btext, "short")
             continue
 
         kept = list(block)
@@ -359,6 +372,7 @@ def compute_cut_plan(
             
         if not kept:
             skip_counts["CUTOFF"] += 1
+            _record_drop(bs, be, btext, "cutoff_trimmed_empty")
             continue
 
         keep.append((kept[0]["start"], kept[-1]["end"], " ".join(w["text"] for w in kept)))
@@ -366,6 +380,7 @@ def compute_cut_plan(
     # Two-tier dedupe: rule-based (B) → ambiguous-zone LLM review (C).
     # Walk through keep[] producing decisions: drop[i] = True means skip block i.
     drop = [False] * len(keep)
+    drop_reason: list[str | None] = [None] * len(keep)
     rule_drops, llm_drops = 0, 0
     llm_calls, llm_keep = 0, 0
     if llm_cache is None:
@@ -388,10 +403,9 @@ def compute_cut_plan(
         d1 = e1 - s1
         d2 = e2 - s2
         if ratio >= DEDUPE_RATIO and min(d1, d2) < SHORT_REPEAT_MAX:
-            if d1 <= d2:
-                drop[i] = True
-            else:
-                drop[i + 1] = True
+            victim = i if d1 <= d2 else i + 1
+            drop[victim] = True
+            drop_reason[victim] = f"dedupe_rule (ratio {ratio:.2f} vs block {i if victim != i else i + 1})"
             rule_drops += 1
             continue
 
@@ -401,14 +415,21 @@ def compute_cut_plan(
             llm_calls += 1
             if verdict == "DROP_FIRST":
                 drop[i] = True
+                drop_reason[i] = f"dedupe_llm (ratio {ratio:.2f}, verdict DROP_FIRST)"
                 llm_drops += 1
             elif verdict == "DROP_SECOND":
                 drop[i + 1] = True
+                drop_reason[i + 1] = f"dedupe_llm (ratio {ratio:.2f}, verdict DROP_SECOND)"
                 llm_drops += 1
             else:
                 llm_keep += 1
 
+    for idx, (s, e, t) in enumerate(keep):
+        if drop[idx]:
+            _record_drop(s, e, t, drop_reason[idx] or "dedupe")
+
     deduped = [(s, e, t) for idx, (s, e, t) in enumerate(keep) if not drop[idx]]
+    dropped.sort(key=lambda d: d["start"])
 
     stats = {
         "blocks_input": len(blocks),
@@ -421,6 +442,7 @@ def compute_cut_plan(
         "deduped_llm": llm_drops,
         "llm_calls": llm_calls,
         "llm_keep_both": llm_keep,
+        "dropped_blocks": dropped,
     }
     return deduped, stats
 
@@ -512,6 +534,23 @@ def main() -> None:
     print(f"  skip: pure_filler={stats['skip_pure_filler']} cutoff={stats['skip_cutoff']} short={stats['skip_short']}")
     print(f"  intra-block dedupe: dropped {stats.get('intra_stutter_words_dropped', 0)} stuttered words")
     print(f"  dedupe: rule={stats['deduped_rule']} llm={stats['deduped_llm']} (llm_calls={stats['llm_calls']}, kept_both={stats['llm_keep_both']})")
+
+    # Verbatim text of every dropped block. Counts alone cannot tell a retake
+    # apart from real content the dedupe swallowed — read these before render.
+    dropped = stats.get("dropped_blocks", [])
+    n_raw, n_kept = stats["blocks_input"], stats["blocks_kept"]
+    print(f"  dropped blocks ({len(dropped)}) — read these, they are the ones that could be real content:")
+    if not dropped:
+        print("    (none)")
+    for d in dropped:
+        txt = d["text"] if len(d["text"]) <= 200 else d["text"][:200].rstrip() + "…"
+        print(f"    {d['start']:8.2f}-{d['end']:8.2f} ({d['end']-d['start']:5.1f}s) [{d['reason']}]: {txt}")
+    if n_raw != n_kept + len(dropped):
+        print(f"    !! BOOK-KEEPING MISMATCH: raw {n_raw} != kept {n_kept} + dropped {len(dropped)} "
+              f"— a block vanished without being recorded; do NOT trust this cut plan")
+    else:
+        print(f"    ✓ accounted for: raw {n_raw} = kept {n_kept} + dropped {len(dropped)}")
+
     print(f"  estimated output: {out_dur:.1f}s ({out_dur/60:.2f}min) — cut {(duration-out_dur)/duration*100:.1f}%")
 
     print(f"[4/5] Write EDL")
